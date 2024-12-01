@@ -39,18 +39,19 @@ start_time = time.time()
 
 # Define layers with swapped x and y
 layer1 = structure2D(np.array([0.2,0.4]),0.4, np.array([1,2,3]))
-layer2 = structure2D(np.array([20, 40, 60, 100]),20, np.array([1, 2, 3, 4, 4]))
+layer2 = structure2D(np.array([]),1, np.array([1]))
 
 # Create FDTD grids
-grider_er = FDTD_grid(0.6, [layer1], 0.2, 0.1)
+#grider_ur = FDTD_grid(0.6, [layer1], 0.2, 0.1)
+grider_er = FDTD_grid(1, [layer2], 0.2, 0.2)
 layer1 = structure2D(np.array([]),0.4, np.array([1]))
-layer2 = structure2D(np.array([]),20, np.array([1]))
-grider_ur = FDTD_grid(0.6, [layer1], 0.2, 0.1)
+layer2 = structure2D(np.array([]),1, np.array([1]))
+grider_ur = FDTD_grid(1, [layer2], 0.2, 0.2)
 
 end_time = time.time()
 
 # Initialize FDTD Simulator (assuming it's properly defined)
-fdtd = FDTD_Simulator2D(grider_er, grider_ur, [0, 0], [2, 3])
+fdtd = FDTD_Simulator2D(grider_er, grider_ur, [0, 0], [1, 1])
 
 print("Simulation setup time:", end_time - start_time)
 
@@ -62,3 +63,4 @@ plt.title('Dielectric Grid')
 plt.xlabel('X Position')
 plt.ylabel('Y Position')
 plt.show()
+

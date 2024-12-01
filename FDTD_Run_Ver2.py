@@ -1,37 +1,27 @@
 import numpy as np
 import torch
+import method
 from structure2D_Ver2 import FDTD_grid
 import matplotlib.pyplot as plt
+from scipy.sparse import diags
 
 class FDTD_Simulator2D:
 
-    def __init__(self, fdtd_er_grid: FDTD_grid, fdtd_ur_grid: FDTD_grid, BC, kinc):
+    def __init__(self, fdtd_er_grid: FDTD_grid, fdtd_ur_grid: FDTD_grid, BC, lda0):
+        self.lda0=lda0
         self.BC = BC
-        self.kinc = kinc
-        #This is the part utilizing 2X method to generate the x,y,z permitivity&permibility 
+        self.kinc = [0,0]
+        #This is the part utilizing 2X method to generate the x,y,z permitivity & permibility 
         # grid based on the defined structure
-        ER2 = fdtd_er_grid.dielectric_grid.repeat_interleave(2, dim=0).repeat_interleave(2, dim=1)
-        UR2 = fdtd_ur_grid.dielectric_grid.repeat_interleave(2, dim=0).repeat_interleave(2, dim=1)
-        if not ER2.shape == UR2.shape:
-            raise ValueError("Shape of the ER matrix does not equal the UR matrix")
-        Nx2, Ny2 = ER2.shape
-        # Extract tensor elements from ER2
-        self.ERxx = ER2[1:Nx2:2, 0:Ny2:2]  # Starting at i=2 (index 1) and j=1 (index 0)
-        self.ERyy = ER2[0:Nx2:2, 1:Ny2:2]  # Starting at i=1 (index 0) and j=2 (index 1)
-        self.ERzz = ER2[0:Nx2:2, 0:Ny2:2]  # Starting at i=1 (index 0) and j=1 (index 0)
-
-        # Extract tensor elements from UR2
-        self.URxx = UR2[0:Nx2:2, 1:Ny2:2]  # Starting at i=1 (index 0) and j=2 (index 1)
-        self.URyy = UR2[1:Nx2:2, 0:Ny2:2]  # Starting at i=2 (index 1) and j=1 (index 0)
-        self.URzz = UR2[1:Nx2:2, 1:Ny2:2]  # Starting at i=2 (index 1) and j=2 (index 1)
-
+        NPML=[2,2,2,2]
+        self.ERxx,self.ERyy,self.ERzz,self.URxx,self.URyy,self.URzz=self.PML_layer(fdtd_er_grid, fdtd_ur_grid,NPML)
         # Compute derivative matrices
-        Nx = int(Nx2 / 2)
-        Ny = int(Ny2 / 2)
+        Ny,Nx=self.ERxx.shape
         # Generate the differentia gride
         RES = [fdtd_er_grid.dx, fdtd_er_grid.dy]
         NS = [Nx, Ny]
         self.DEX, self.DEY, self.DHX, self.DHY = self.yeeder2d(NS, RES, self.BC, self.kinc)
+        self.to_gpu()
 
     def yeeder2d(self, NS, RES, BC, kinc):
         #This is the function to generate the differentiate gride based on the shape
@@ -125,78 +115,119 @@ Outputs:
         if Nx == 1:
             DEX = -1j * kinc[0] * torch.eye(M, M, dtype=torch.cfloat)
         else:
-            # Initialize indices and values for DEX
-            row_indices = []
-            col_indices = []
-            values = []
-
-            # Main diagonal
-            indices = torch.arange(M)
-            row_indices.extend(indices.tolist())
-            col_indices.extend(indices.tolist())
-            values.extend((-1 / dx) * np.ones(M))
-
-            # Upper diagonal
-            indices = torch.arange(M - 1)
-            # Exclude the last element of each row for Dirichlet BCs
-            mask = torch.ones(M - 1, dtype=bool)
-            mask[Nx - 1::Nx] = False  # Zero at positions where columns wrap to next row
-            indices = indices[mask]
-            row_indices.extend(indices.tolist())
-            col_indices.extend((indices + 1).tolist())
-            values.extend((1 / dx) * np.ones(len(indices)))
-
+            d0 = -np.ones(M)
+            d1 = np.ones(M)
+            d1[Nx:M:Nx] = 0
+            DEX=np.zeros((M,M))
+            #DEX = diags([d0,d1], [0,1], shape=(M, M), format='csr')/dx  # Sparse matrix in scipy
+            DEX = method.dense_diags([d0,d1],[0,1],DEX)/dx
             # Incorporate Periodic Boundary Conditions
             if BC[0] == 1:
-                # Add entries for periodic boundary conditions
-                indices = torch.arange(Nx - 1, M, Nx)
-                row_indices.extend(indices.tolist())
-                col_indices.extend((indices - (Nx - 1)).tolist())
-                phase = np.exp(-1j * kinc[0] * Nx * dx)
-                values.extend((1 / dx) * phase * np.ones(len(indices)))
+                d1 = np.zeros(M, dtype=np.complex64)
+                d1[:M:Nx] = np.exp(-1j * kinc[0] * Nx * dx) / dx
+                DEX = method.dense_diags([d1], [1 - Nx], DEX)
 
-            # Create sparse tensor
-            indices = torch.tensor([row_indices, col_indices], dtype=torch.long)
-            values = torch.tensor(values, dtype=torch.cfloat)
-            DEX = torch.sparse_coo_tensor(indices, values, size=(M, M), dtype=torch.cfloat)
-
+            # Create PyTorch sparse tensor
+            DEX_torch = torch.tensor(DEX,dtype=torch.complex64)
         # Build DEY
         if Ny == 1:
             DEY = -1j * kinc[1] * torch.eye(M, M, dtype=torch.cfloat)
         else:
-            # Initialize indices and values for DEY
-            row_indices = []
-            col_indices = []
-            values = []
-
-            # Main diagonal
-            indices = torch.arange(M)
-            row_indices.extend(indices.tolist())
-            col_indices.extend(indices.tolist())
-            values.extend((-1 / dy) * np.ones(M))
-
-            # Upper diagonal (offset by Nx)
-            indices = torch.arange(M - Nx)
-            row_indices.extend(indices.tolist())
-            col_indices.extend((indices + Nx).tolist())
-            values.extend((1 / dy) * np.ones(len(indices)))
-
+            d0 = -np.ones(M)
+            d1 = np.ones(M)
+            DEY=np.zeros((M,M))
+            #DEX = diags([d0,d1], [0,1], shape=(M, M), format='csr')/dx  # Sparse matrix in scipy
+            DEY = method.dense_diags([d0,d1],[0,Nx],DEY)/dy
             # Incorporate Periodic Boundary Conditions
             if BC[1] == 1:
-                # Add entries for periodic boundary conditions
-                indices = torch.arange(M - Nx, M)
-                row_indices.extend(indices.tolist())
-                col_indices.extend((indices % Nx).tolist())
-                phase = np.exp(-1j * kinc[1] * Ny * dy)
-                values.extend((1 / dy) * phase * np.ones(len(indices)))
+                d1 = np.zeros(M, dtype=np.complex64)
+                d1[:M:Nx] = np.exp(-1j * kinc[1] * Ny * dy) / dy
+                DEY = method.dense_diags([d1], [Nx - M], DEY)
 
-            # Create sparse tensor
-            indices = torch.tensor([row_indices, col_indices], dtype=torch.long)
-            values = torch.tensor(values, dtype=torch.cfloat)
-            DEY = torch.sparse_coo_tensor(indices, values, size=(M, M), dtype=torch.cfloat)
+            # Create PyTorch sparse tensor
+            DEY_torch = torch.tensor(DEY,dtype=torch.complex64)
 
         # Build DHX and DHY
-        DHX = -DEX.transpose(0, 1)#need conjugate
-        DHY = -DEY.transpose(0, 1)
+        DHX_torch = -DEX_torch.transpose(0, 1)#need conjugate
+        DHY_torch = -DEY_torch.transpose(0, 1)
 
-        return DEX.coalesce(), DEY.coalesce(), DHX.coalesce(), DHY.coalesce()
+        return DEX_torch, DEY_torch, DHX_torch, DHY_torch
+    def PML_layer(self,fdtd_er_grid: FDTD_grid, fdtd_ur_grid: FDTD_grid,NPML):
+        #The main purpose of this function is to add the PML layer to the structure
+        #This function take Er grid and Ur grid and generate the x,y,z direction grid based on this
+        #The x,y,z direction grid generation based on 2X method
+        #Input
+        #fdtd_er_grid: permitivity grid
+        #fdtd_ur_grid: permibility grid
+        #NPML: contain 4 numbers, correspond to [NXLO NXHI NYLO NYHI]
+        #The permitivity of the layer defined like this: mu'=S*Er
+        #S=[sy/sx,0,0],[0,sx/sy,0],[0,0,sx*sy]
+        #sx(x)=ax(x)[1-60i*sigma_x(x)]
+        #sy(x)=ay(y)[1-60i*sigma_y(y)]
+        #sigma_x(x)=sigma_max*sin(pi*x/2/Lx)^2
+        #sigma_y(y)=sigma_max*sin(pi*y/2/Ly)^2
+
+        ER2 = fdtd_er_grid.dielectric_grid.repeat_interleave(2, dim=0).repeat_interleave(2, dim=1).numpy()
+        UR2 = fdtd_ur_grid.dielectric_grid.repeat_interleave(2, dim=0).repeat_interleave(2, dim=1).numpy()
+        if not ER2.shape == UR2.shape:
+            raise ValueError("Shape of the ER matrix does not equal the UR matrix")
+        Ny2, Nx2 = ER2.shape#in python the x y axis are flipped
+        NXLO,NXHI,NYLO,NYHI=np.array(NPML)*2
+        amax = 4
+        cmax = 1
+        p    = 3
+        sx=np.zeros((Ny2,Nx2),dtype=complex)
+        sy=np.zeros((Ny2,Nx2),dtype=complex)
+        #Add layer based on the equation described above
+        for nx in range(0,NXLO+1):
+            ax=1+(amax-1)*(nx/NXLO)**p
+            cx=cmax*np.sin(0.5*np.pi*nx/NXLO)**2
+            sx[NXLO-nx,:]=ax*(1-1j*60*cx)
+        for nx in range(0,NXHI+1):
+            ax=1+(amax-1)*(nx/NXHI)**p
+            cx=cmax*np.sin(0.5*np.pi*nx/NXHI)**2
+            sx[Nx2-NXHI+nx-1,:]=ax*(1-1j*60*cx)
+        for ny in range(0,NYLO+1):
+            ay=1+(amax-1)*(ny/NYLO)**p
+            cy=cmax*np.sin(0.5*np.pi*ny/NYLO)**2
+            sy[:,NYLO-ny]=ay*(1-1j*60*cy)
+        for ny in range(0,NYHI+1):
+            ay=1+(amax-1)*(ny/NYHI)**p
+            cy=cmax*np.sin(0.5*np.pi*ny/NYHI)**2
+            sy[:,Ny2-NYHI+ny-1]=ay*(1-1j*60*cy)
+        ER2xx = ER2/sx*sy
+        ER2yy = ER2*sx/sy
+        ER2zz = ER2*sx*sy
+
+        UR2xx = UR2/sx*sy
+        UR2yy = UR2*sx/sy
+        UR2zz = UR2*sx*sy
+
+
+        # Extract tensor elements from ER2
+        ERxx = torch.tensor(ER2xx[1:Ny2:2, 0:Nx2:2]) # Starting at i=2 (index 1) and j=1 (index 0)
+        ERyy = torch.tensor(ER2yy[0:Ny2:2, 1:Nx2:2])  # Starting at i=1 (index 0) and j=2 (index 1)
+        ERzz = torch.tensor(ER2zz[0:Ny2:2, 0:Nx2:2])  # Starting at i=1 (index 0) and j=1 (index 0)
+
+        # Extract tensor elements from UR2
+        URxx = torch.tensor(UR2xx[0:Ny2:2, 1:Nx2:2])  # Starting at i=1 (index 0) and j=2 (index 1)
+        URyy = torch.tensor(UR2yy[1:Ny2:2, 0:Nx2:2])  # Starting at i=2 (index 1) and j=1 (index 0)
+        URzz = torch.tensor(UR2zz[1:Ny2:2, 1:Nx2:2])  # Starting at i=2 (index 1) and j=2 (index 1)
+        return ERxx,ERyy,ERzz,URxx,URyy,URzz
+    def frame_update(self):
+        pass
+    def to_cpu(self):
+        pass
+    def to_gpu(self):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
+        self.DEX= self.DEX.to_sparse().to(device)
+        self.DEY=self.DEY.to_sparse().to(device) 
+        self.DHX = self.DHX.to_sparse().to(device)
+        self.DHY =self.DHY.to_sparse().to(device)
+        self.ERxx =self.ERxx.to_sparse().to(device)
+        self.ERyy = self.ERyy.to_sparse().to(device)
+        self.ERzz = self.ERzz.to_sparse().to(device)
+        self.URxx = self.URxx.to_sparse().to(device)
+        self.URyy = self.URyy.to_sparse().to(device)
+        self.URzz = self.URzz.to_sparse().to(device)
